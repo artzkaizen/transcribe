@@ -1,14 +1,13 @@
-import { Hono } from "hono";
+import { OpenAPIHono, createRoute, z } from "@hono/zod-openapi";
 import { cors } from "hono/cors";
-import * as z  from "zod";
-import { zValidator } from "@hono/zod-validator";
+import { Scalar } from "@scalar/hono-api-reference";
 import { serve } from "inngest/hono";
 import { inngest } from "./inngest/client";
 import { sweep, processRecording } from "./inngest/functions/ingest";
 import { db, recordings, transcripts } from "./lib/db";
 import { eq } from "drizzle-orm";
 
-const app = new Hono();
+const app = new OpenAPIHono();
 
 // --- Middleware ---
 
@@ -24,69 +23,215 @@ app.use(
   })
 );
 
-// --- Routes ---
+app.get("/", (c) => c.json({ status: "ok" }));
 
-app.get("/", (c) => {
-  return c.json({ status: "ok" });
+// --- Schemas ---
+
+const StatusEnum = z.enum([
+  "pending",
+  "downloading",
+  "transcribing",
+  "completed",
+  "failed",
+]);
+
+const RecordingSchema = z
+  .object({
+    id: z.string().openapi({ example: "abc123-1234567890" }),
+    meetingId: z.string(),
+    meetingName: z.string().nullable(),
+    startTime: z.number().int().nullable(),
+    endTime: z.number().int().nullable(),
+    videoUrl: z.string(),
+    status: StatusEnum.nullable(),
+    error: z.string().nullable(),
+    createdAt: z.number().int().nullable(),
+    updatedAt: z.number().int().nullable(),
+  })
+  .openapi("Recording");
+
+const TranscriptSchema = z
+  .object({
+    id: z.number().int(),
+    recordingId: z.string(),
+    text: z.string(),
+    vtt: z.string().nullable(),
+    language: z.string().nullable(),
+    durationSeconds: z.number().nullable(),
+    model: z.string().nullable(),
+    createdAt: z.number().int().nullable(),
+  })
+  .openapi("Transcript");
+
+const ErrorSchema = z.object({ error: z.string() });
+
+// --- Route Definitions ---
+
+const listTranscriptsRoute = createRoute({
+  method: "get",
+  path: "/transcripts",
+  tags: ["Transcripts"],
+  summary: "List recordings",
+  request: {
+    query: z.object({
+      limit: z.coerce
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .optional()
+        .default(20)
+        .openapi({ description: "Page size (1-100)", example: 20 }),
+      offset: z.coerce
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .default(0)
+        .openapi({ description: "Page offset", example: 0 }),
+      status: StatusEnum.optional().openapi({
+        description: "Filter by processing status",
+      }),
+    }),
+  },
+  responses: {
+    200: {
+      content: {
+        "application/json": {
+          schema: z.object({ data: z.array(RecordingSchema) }),
+        },
+      },
+      description: "List of recordings",
+    },
+  },
 });
 
-const transcriptsQuerySchema = z.object({
-  limit: z.coerce.number().int().min(1).max(100).optional().default(20),
-  offset: z.coerce.number().int().min(0).optional().default(0),
-  status: z
-    .enum(["pending", "downloading", "transcribing", "completed", "failed"])
-    .optional(),
+const getTranscriptRoute = createRoute({
+  method: "get",
+  path: "/transcripts/{id}",
+  tags: ["Transcripts"],
+  summary: "Get a recording with its transcript",
+  request: {
+    params: z.object({
+      id: z.string().min(1).openapi({
+        param: { name: "id", in: "path" },
+        example: "abc123-1234567890",
+      }),
+    }),
+  },
+  responses: {
+    200: {
+      content: {
+        "application/json": {
+          schema: z.object({
+            recording: RecordingSchema,
+            transcript: TranscriptSchema.nullable(),
+          }),
+        },
+      },
+      description: "Recording with transcript",
+    },
+    404: {
+      content: { "application/json": { schema: ErrorSchema } },
+      description: "Not found",
+    },
+  },
 });
 
-app.get(
-  "/transcripts",
-  zValidator("query", transcriptsQuerySchema),
-  async (c) => {
-    const { limit, offset, status } = c.req.valid("query");
+const ingestRoute = createRoute({
+  method: "post",
+  path: "/ingest",
+  tags: ["Ingest"],
+  summary: "Manually queue a BBB recording for transcription",
+  description: "Requires `MANUAL_INGEST_ENABLED=true`.",
+  request: {
+    body: {
+      required: true,
+      content: {
+        "application/json": {
+          schema: z.object({
+            url: z.string().url().openapi({
+              example:
+                "https://bbb.example.com/playback/presentation/2.3/abc123-1234567890",
+            }),
+            name: z.string().optional().openapi({ example: "Team Meeting" }),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    201: {
+      content: {
+        "application/json": {
+          schema: z.object({
+            id: z.string(),
+            status: z.string(),
+            alreadyQueued: z.boolean(),
+          }),
+        },
+      },
+      description: "Recording queued",
+    },
+    200: {
+      content: {
+        "application/json": {
+          schema: z.object({
+            id: z.string(),
+            status: z.string(),
+            alreadyQueued: z.boolean(),
+          }),
+        },
+      },
+      description: "Recording already queued",
+    },
+    403: {
+      content: { "application/json": { schema: ErrorSchema } },
+      description: "Manual ingest is disabled",
+    },
+    422: {
+      content: { "application/json": { schema: ErrorSchema } },
+      description: "Could not extract a BBB record ID from the URL",
+    },
+  },
+});
 
-    let query = db.select().from(recordings);
+// --- Handlers ---
 
-    if (status) {
-      query = query.where(eq(recordings.status, status)) as typeof query;
-    }
+app.openapi(listTranscriptsRoute, async (c) => {
+  const { limit, offset, status } = c.req.valid("query");
 
-    const data = await query.limit(limit).offset(offset);
-
-    return c.json({ data });
+  let query = db.select().from(recordings);
+  if (status) {
+    query = query.where(eq(recordings.status, status)) as typeof query;
   }
-);
-
-const transcriptParamSchema = z.object({
-  id: z.string().min(1),
+  const data = await query.limit(limit).offset(offset);
+  return c.json({ data }, 200);
 });
 
-app.get(
-  "/transcripts/:id",
-  zValidator("param", transcriptParamSchema),
-  async (c) => {
-    const { id } = c.req.valid("param");
+app.openapi(getTranscriptRoute, async (c) => {
+  const { id } = c.req.valid("param");
 
-    const [recording] = await db
-      .select()
-      .from(recordings)
-      .where(eq(recordings.id, id))
-      .limit(1);
+  const [recording] = await db
+    .select()
+    .from(recordings)
+    .where(eq(recordings.id, id))
+    .limit(1);
 
-    if (!recording) {
-      return c.json({ error: "Not found" }, 404);
-    }
-
-    const [transcript] = await db
-      .select()
-      .from(transcripts)
-      .where(eq(transcripts.recordingId, id))
-      .limit(1);
-
-    return c.json({ recording, transcript: transcript ?? null });
+  if (!recording) {
+    return c.json({ error: "Not found" }, 404);
   }
-);
 
-// BBB record IDs look like: {sha1hex}-{unix_ms}, e.g. 27e7027d8fcc7a4abacade362494209066c8073b-1770364951714
+  const [transcript] = await db
+    .select()
+    .from(transcripts)
+    .where(eq(transcripts.recordingId, id))
+    .limit(1);
+
+  return c.json({ recording, transcript: transcript ?? null }, 200);
+});
+
+// BBB record IDs look like: {sha1hex}-{unix_ms}
 const BBB_RECORD_ID = /^[a-f0-9]+-\d+$/;
 
 function parseBbbUrl(raw: string): { id: string; videoUrl: string } | null {
@@ -96,49 +241,58 @@ function parseBbbUrl(raw: string): { id: string; videoUrl: string } | null {
   return { id: segment, videoUrl: raw };
 }
 
-const ingestBodySchema = z.object({
-  url: z.url(),
-  name: z.string().optional(),
+app.openapi(ingestRoute, async (c) => {
+  if (process.env.MANUAL_INGEST_ENABLED !== "true") {
+    return c.json({ error: "Manual ingest is disabled" }, 403);
+  }
+
+  const { url, name } = c.req.valid("json");
+
+  const bbb = parseBbbUrl(url);
+  if (!bbb) {
+    return c.json({ error: "Could not extract a BBB record ID from the URL" }, 422);
+  }
+
+  const { id, videoUrl } = bbb;
+
+  const [existing] = await db
+    .select()
+    .from(recordings)
+    .where(eq(recordings.id, id))
+    .limit(1);
+
+  if (existing) {
+    return c.json({ id, status: existing.status ?? "pending", alreadyQueued: true }, 200);
+  }
+
+  await db.insert(recordings).values({
+    id,
+    meetingId: id,
+    meetingName: name ?? id,
+    videoUrl,
+    status: "pending",
+  });
+
+  await inngest.send({
+    name: "bbb/ingest.process",
+    data: { recordingId: id, videoUrl },
+  });
+
+  return c.json({ id, status: "pending", alreadyQueued: false }, 201);
 });
 
-app.post(
-  "/ingest",
-  zValidator("json", ingestBodySchema),
-  async (c) => {
-    if (process.env.MANUAL_INGEST_ENABLED !== "true") {
-      return c.json({ error: "Manual ingest is disabled" }, 403);
-    }
+// --- OpenAPI & Scalar ---
 
-    const { url, name } = c.req.valid("json");
+app.doc("/doc", {
+  openapi: "3.0.0",
+  info: {
+    title: "Transcribe API",
+    version: "1.0.0",
+    description: "API for managing BBB recording transcriptions",
+  },
+});
 
-    const bbb = parseBbbUrl(url);
-    if (!bbb) {
-      return c.json({ error: "Could not extract a BBB record ID from the URL" }, 422);
-    }
-
-    const { id, videoUrl } = bbb;
-
-    const [existing] = await db.select().from(recordings).where(eq(recordings.id, id)).limit(1);
-    if (existing) {
-      return c.json({ id, status: existing.status, alreadyQueued: true });
-    }
-
-    await db.insert(recordings).values({
-      id,
-      meetingId: id,
-      meetingName: name ?? id,
-      videoUrl,
-      status: "pending",
-    });
-
-    await inngest.send({
-      name: "bbb/ingest.process",
-      data: { recordingId: id, videoUrl },
-    });
-
-    return c.json({ id, status: "pending", alreadyQueued: false }, 201);
-  }
-);
+app.get("/scalar", Scalar({ url: "/doc", pageTitle: "Transcribe API" }));
 
 // --- Inngest ---
 
@@ -147,8 +301,6 @@ const inngestHandler = serve({
   functions: [sweep, processRecording],
 });
 
-app.use("/api/inngest", async (c) => {
-  return inngestHandler(c);
-});
+app.use("/api/inngest", async (c) => inngestHandler(c));
 
 export default app;
