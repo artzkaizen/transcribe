@@ -1,35 +1,33 @@
-import { sqliteTable, text, integer, real } from "drizzle-orm/sqlite-core";
-import { drizzle } from "drizzle-orm/bun-sqlite";
-import { Database } from "bun:sqlite";
+import { pgTable, text, integer, real, serial, pgEnum } from "drizzle-orm/pg-core";
+import { drizzle } from "drizzle-orm/postgres-js";
 import { sql } from "drizzle-orm";
-import { mkdirSync } from "fs";
-import { dirname } from "path";
+import postgres from "postgres";
 
 // --- Schema ---
 
-const statusEnum = [
+export const statusEnum = pgEnum("recording_status", [
   "pending",
   "downloading",
   "transcribing",
   "completed",
   "failed",
-] as const;
+]);
 
-export const recordings = sqliteTable("recordings", {
+export const recordings = pgTable("recordings", {
   id: text("id").primaryKey(), // BBB recordID
   meetingId: text("meeting_id").notNull(),
   meetingName: text("meeting_name"),
   startTime: integer("start_time"),
   endTime: integer("end_time"),
   videoUrl: text("video_url").notNull(),
-  status: text("status", { enum: statusEnum }).default("pending"),
+  status: statusEnum("status").default("pending"),
   error: text("error"),
-  createdAt: integer("created_at").default(sql`(unixepoch())`),
-  updatedAt: integer("updated_at").default(sql`(unixepoch())`),
+  createdAt: integer("created_at").default(sql`extract(epoch from now())::integer`),
+  updatedAt: integer("updated_at").default(sql`extract(epoch from now())::integer`),
 });
 
-export const transcripts = sqliteTable("transcripts", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const transcripts = pgTable("transcripts", {
+  id: serial("id").primaryKey(),
   recordingId: text("recording_id")
     .notNull()
     .unique()
@@ -39,7 +37,7 @@ export const transcripts = sqliteTable("transcripts", {
   language: text("language"),
   durationSeconds: real("duration_seconds"),
   model: text("model").default("base"),
-  createdAt: integer("created_at").default(sql`(unixepoch())`),
+  createdAt: integer("created_at").default(sql`extract(epoch from now())::integer`),
 });
 
 // --- DB Instance ---
@@ -47,12 +45,5 @@ export const transcripts = sqliteTable("transcripts", {
 export type Recording = typeof recordings.$inferSelect;
 export type Transcript = typeof transcripts.$inferSelect;
 
-export function createDb(path?: string) {
-  const dbPath = path ?? process.env.DATABASE_PATH ?? "data/app.db";
-  mkdirSync(dirname(dbPath), { recursive: true });
-  const sqlite = new Database(dbPath, { create: true });
-  sqlite.exec("PRAGMA journal_mode = WAL;");
-  return drizzle(sqlite, { schema: { recordings, transcripts } });
-}
-
-export const db = createDb();
+const client = postgres(process.env.DATABASE_URL ?? "postgres://inngest:password@localhost:5432/transcribe");
+export const db = drizzle(client, { schema: { recordings, transcripts } });

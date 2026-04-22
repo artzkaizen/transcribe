@@ -86,6 +86,62 @@ app.get(
   }
 );
 
+// BBB record IDs look like: {sha1hex}-{unix_ms}, e.g. 27e7027d8fcc7a4abacade362494209066c8073b-1770364951714
+const BBB_RECORD_ID = /^[a-f0-9]+-\d+$/;
+
+function parseBbbUrl(raw: string): { id: string; videoUrl: string } | null {
+  const parsed = new URL(raw);
+  const segment = parsed.pathname.split("/").find((p) => BBB_RECORD_ID.test(p));
+  if (!segment) return null;
+  return { id: segment, videoUrl: raw };
+}
+
+const ingestBodySchema = z.object({
+  url: z.url(),
+  name: z.string().optional(),
+});
+
+app.post(
+  "/ingest",
+  zValidator("json", ingestBodySchema),
+  async (c) => {
+    if (process.env.MANUAL_INGEST_ENABLED !== "true") {
+      return c.json({ error: "Manual ingest is disabled" }, 403);
+    }
+
+    const { url, name } = c.req.valid("json");
+
+    const bbb = parseBbbUrl(url);
+    if (!bbb) {
+      return c.json({ error: "Could not extract a BBB record ID from the URL" }, 422);
+    }
+
+    const { id, videoUrl } = bbb;
+
+    const existing = db.select().from(recordings).where(eq(recordings.id, id)).get();
+    if (existing) {
+      return c.json({ id, status: existing.status, alreadyQueued: true });
+    }
+
+    db.insert(recordings)
+      .values({
+        id,
+        meetingId: id,
+        meetingName: name ?? id,
+        videoUrl,
+        status: "pending",
+      })
+      .run();
+
+    await inngest.send({
+      name: "bbb/ingest.process",
+      data: { recordingId: id, videoUrl },
+    });
+
+    return c.json({ id, status: "pending", alreadyQueued: false }, 201);
+  }
+);
+
 // --- Inngest ---
 
 const inngestHandler = serve({

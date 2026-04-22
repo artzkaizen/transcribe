@@ -3,8 +3,6 @@ services:
     build: .
     ports:
       - "3000:3000"
-    volumes:
-      - app_data:/app/data
     environment:
       - BBB_BASE_URL=${BBB_BASE_URL}
       - BBB_SHARED_SECRET=${BBB_SHARED_SECRET}
@@ -12,7 +10,8 @@ services:
       - INNGEST_SIGNING_KEY=${INNGEST_SIGNING_KEY}
       - INNGEST_BASE_URL=http://inngest:8288
       - WHISPER_MODEL=${WHISPER_MODEL:-base}
-      - DATABASE_PATH=data/app.db
+      - MANUAL_INGEST_ENABLED=${MANUAL_INGEST_ENABLED:-false}
+      - DATABASE_URL=postgres://inngest:${POSTGRES_PASSWORD}@postgres:5432/transcribe
     depends_on:
       inngest:
         condition: service_healthy
@@ -51,6 +50,7 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U inngest -d inngest"]
@@ -70,6 +70,5 @@ services:
       retries: 5
 
 volumes:
-  app_data:
   postgres_data:
   redis_data:
